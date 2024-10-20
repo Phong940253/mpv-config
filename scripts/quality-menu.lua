@@ -1,4 +1,4 @@
--- quality-menu 4.2.0 - 2024-Oct-04
+-- quality-menu 4.1.1 - 2023-Oct-22
 -- https://github.com/christoph-heinrich/mpv-quality-menu
 --
 -- Change the stream video and audio quality on the fly.
@@ -538,6 +538,109 @@ local function process_json_string(json)
     return process_json(json_table)
 end
 
+---@param url string
+local function download_formats(url)
+    if currently_fetching[url] then return end
+
+    msg.info('fetching available formats...')
+
+    if not (ytdl.searched) then
+        local ytdl_mcd = mp.find_config_file(opts.ytdl_ver)
+        if not (ytdl_mcd == nil) then
+            msg.verbose('found ytdl at: ' .. ytdl_mcd)
+            ytdl.path = ytdl_mcd
+        end
+        ytdl.searched = true
+    end
+
+    local ytdl_format = mp.get_property('ytdl-format')
+    local raw_options = mp.get_property_native('ytdl-raw-options')
+    local command = { ytdl.path, '--no-warnings', '--no-playlist', '-J' }
+    if ytdl_format and #ytdl_format > 0 and ytdl_format ~= 'ytdl' then
+        command[#command + 1] = '-f'
+        command[#command + 1] = ytdl_format
+    end
+    for param, arg in pairs(raw_options) do
+        command[#command + 1] = '--' .. param
+        if #arg > 0 then
+            command[#command + 1] = arg
+        end
+    end
+    if opts.ytdl_ver == 'yt-dlp' then command[#command + 1] = '--no-match-filter' end
+    command[#command + 1] = '--'
+    command[#command + 1] = url
+
+    msg.verbose('calling ytdl with command: ' .. table.concat(command, ' '))
+
+    --- result.status is exit status
+    --- result.error_string can be empty string, 'killed' or 'init'
+    ---@param success boolean
+    ---@param result { status: integer, stdout: string, stderr: string, error_string: string , killed_by_us: boolean }
+    ---@param error string | nil
+    local function callback(success, result, error)
+        currently_fetching[url] = nil
+        if result.killed_by_us then return end
+        if result.status < 0 or result.stdout == '' or result.error_string ~= '' then
+            osd_message('fetching formats failed...', 2)
+            msg.verbose('status:', result.status)
+            msg.verbose('reason:', result.error_string)
+            msg.verbose('stdout:', result.stdout)
+            msg.verbose('stderr:', result.stderr)
+
+            -- trim our stderr to avoid spurious newlines
+            local ytdl_err = result.stderr:gsub('^%s*(.-)%s*$', '%1')
+            msg.error(ytdl_err)
+            local err = 'ytdl failed: '
+            if result.error_string and result.error_string == 'init' then
+                err = err .. 'not found or not enough permissions'
+            elseif not result.killed_by_us then
+                err = err .. 'unexpected error occurred'
+            else
+                err = string.format('%s returned "%d"', err, result.status)
+            end
+            msg.error(err)
+            if string.find(ytdl_err, 'yt%-dl%.org/bug') then
+                -- check version
+                local version_command = {
+                    name = 'subprocess',
+                    capture_stdout = true,
+                    args = { ytdl.path, '--version' }
+                }
+                local version_string = mp.command_native(version_command).stdout
+                local year, month, day = string.match(version_string, '(%d+).(%d+).(%d+)')
+
+                -- sanity check
+                if (tonumber(year) < 2000) or (tonumber(month) > 12) or
+                    (tonumber(day) > 31) then
+                    return
+                end
+                local version_ts = os.time { year = year, month = month, day = day }
+                if (os.difftime(os.time(), version_ts) > 60 * 60 * 24 * 90) then
+                    msg.warn('It appears that your ytdl version is severely out of date.')
+                end
+            end
+            return
+        end
+
+        msg.verbose('ytdl succeeded!')
+        local data = process_json_string(result.stdout)
+        url_data[url] = data
+        uosc_set_format_counts()
+
+        if not data then return end
+        if open_menu_state and open_menu_state == open_menu_state.to_fetching and url == current_url then
+            menu_open(open_menu_state)
+        end
+    end
+
+    currently_fetching[url] = mp.command_native_async({
+        name = 'subprocess',
+        args = command,
+        capture_stdout = true,
+        capture_stderr = true
+    }, callback)
+end
+
 ---Unknown format falls back on highest ranked format if possible
 ---@param id string | nil
 ---@param formats Format[]
@@ -840,6 +943,21 @@ local function uosc_menu_open(formats, active_format, menu_type)
         }
     end
 
+    menu.items[#menu.items + 1] = {
+        title = t('Disabled'),
+        italic = true,
+        muted = true,
+        hint = '—',
+        active = active_format == '',
+        value = {
+            'script-message-to',
+            script_name,
+            menu_type.type .. '-format-set',
+            current_url,
+            '',
+        }
+    }
+
     uosc_show_menu(menu, menu_type)
     destructor = function()
         mp.commandv('script-message-to', 'uosc', 'close-menu', menu.type)
@@ -966,7 +1084,7 @@ local function loading_message(menu_type)
     if uosc_available then
         if open_menu_state and open_menu_state == menu_type then return end
         local menu = {
-            title = menu_type.type_capitalized .. ' Formats',
+            title = menu_type.type_capitalized,
             items = { { icon = 'spinner', selectable = false, value = 'ignore' } },
             type = 'quality-menu-' .. menu_type.name,
             keep_open = true,
